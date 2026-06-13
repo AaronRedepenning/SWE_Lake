@@ -1,0 +1,20 @@
+[project]
+name = "SWE_Lake"
+version = "0.1.0"
+description = "Lake model using shallow water equations"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.6",
+    "pyqt6>=6.11.0",
+    "pyvista>=0.48.4",
+    "scipy>=1.17.1",
+    "vispy>=0.16.2",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.17",
+    "ty>=0.0.49",
+]
