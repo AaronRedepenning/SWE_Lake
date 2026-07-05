@@ -1,12 +1,15 @@
+import bisect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 from numpy.typing import NDArray
 
 Array = NDArray[np.float64]
+Vector = tuple[float, float]
 
 
 ##################################################
@@ -90,26 +93,45 @@ class Grid:
 ##################################################
 # External Forcing                               #
 ##################################################
+class WindModel(Protocol):
+    def __call__(self, *, t: float, step: int) -> Vector: ...
+
+
 @dataclass(frozen=True)
-class Forcing:
-    # Wind
+class ConstantWind:
     wx: float
     wy: float
 
+    def __call__(self, *, t: float, step: int) -> Vector:
+        return self.wx, self.wy
+
+
+@dataclass(frozen=True)
+class StepWind:
+    changes: tuple[tuple[int, float, float], ...]
+
+    def __call__(self, *, t: float, step: int) -> Vector:
+        steps = [s for s, _, _ in self.changes]
+        idx = bisect.bisect_right(steps, step) - 1
+        idx = max(idx, 0)
+
+        _, wx, wy = self.changes[idx]
+        return wx, wy
+
+
+@dataclass(frozen=True)
+class Forcing:
+    wind: WindModel
     constants: Constants
 
-    @property
-    def wind_speed(self) -> float:
-        return math.sqrt(self.wx**2 + self.wy**2)
-
-    @property
-    def wind_stress(self) -> tuple[float, float]:
+    def wind_stress(self, t: float, step: int) -> Vector:
+        wx, wy = self.wind(t=t, step=step)
+        wind_speed = math.sqrt(wx**2 + wy**2)
         wsf = self.constants.wsf
-        wind_speed = self.wind_speed
 
         return (
-            wsf * self.wx * wind_speed,
-            wsf * self.wy * wind_speed,
+            wsf * wx * wind_speed,
+            wsf * wy * wind_speed,
         )
 
 
@@ -143,11 +165,57 @@ class State:
 
 
 ##################################################
+# State History                                  #
+##################################################
+@dataclass
+class StateHistory:
+    steps: NDArray[np.int64]
+    t: Array
+    z: Array
+    U: Array
+    V: Array
+
+    _i: int = field(default=0, init=False, repr=False)
+
+    @classmethod
+    def allocate(cls, *, n: int, shape: tuple[int, int]) -> "StateHistory":
+        return cls(
+            steps=np.empty(n, dtype=np.int64),
+            t=np.empty(n, dtype=np.float64),
+            z=np.empty((n, *shape), dtype=np.float64),
+            U=np.empty((n, *shape), dtype=np.float64),
+            V=np.empty((n, *shape), dtype=np.float64),
+        )
+
+    def record(self, step: int, state: State) -> None:
+        if self._i >= len(self.steps):
+            raise IndexError("Hey! The StateHistory is FULL! ;)")
+
+        self.steps[self._i] = step
+        self.t[self._i] = state.t
+        self.z[self._i] = state.z
+        self.U[self._i] = state.U
+        self.V[self._i] = state.V
+
+        self._i += 1
+
+    def save_npz(self, path: str) -> None:
+        np.savez_compressed(
+            path,
+            steps=self.steps[: self._i],
+            t=self.t[: self._i],
+            z=self.z[: self._i],
+            U=self.U[: self._i],
+            V=self.V[: self._i],
+        )
+
+
+##################################################
 # THE Shallow Water Equations Model!!            #
 ##################################################
 class Method(StrEnum):
-    EULER = "Euler"
-    RK4 = "Runge-Kutta 4"
+    FTCS = "FTCS"
+    FV_RK4 = "Finite-volume RK4"
 
 
 @dataclass
@@ -165,12 +233,36 @@ class SWEModel:
             self.step()
             yield step, self.state.copy()
 
+    def run_with_history(
+        self,
+        n_steps: int,
+        *,
+        save_every: int = 1,
+    ) -> StateHistory:
+        n = 1 + n_steps // save_every
+
+        history = StateHistory.allocate(
+            n=n,
+            shape=self.grid.shape,
+        )
+        history.record(0, self.state)
+
+        for step, state in self.run(n_steps):
+            if step % save_every == 0:
+                history.record(step, state)
+
+        return history
+
     def step(self) -> None:
         # Run numerical integration, using desired method
-        if self.method == Method.EULER:
+        if self.method == Method.FTCS:
+            # Forward-time (Euler)
             dz, dU, dV = self.euler()
-        elif self.method == Method.RK4:
+        elif self.method == Method.FV_RK4:
+            # Runge-Kutta
             dz, dU, dV = self.rk4()
+        else:
+            raise NotImplementedError(f"No method == {self.method}!")
 
         self.state.z += dz
         self.state.U += dU
@@ -193,47 +285,50 @@ class SWEModel:
         return dz, dU, dV
 
     def rk4(self) -> tuple[Array, Array, Array]:
-        s1 = self.state
+        state = self.state
         dt = self.dt
         half_dt = dt / 2.0
 
         # k1
-        k1z, k1U, k1V = self.rhs(s1)
+        k1z, k1U, k1V = self.rhs(state)
 
         # k2
-        s2 = State(
-            s1.z + k1z * half_dt,
-            s1.U + k1U * half_dt,
-            s1.V + k1V * half_dt,
-            s1.t + half_dt,
+        k2z, k2U, k2V = self.rhs(
+            State(
+                state.z + k1z * half_dt,
+                state.U + k1U * half_dt,
+                state.V + k1V * half_dt,
+                state.t + half_dt,
+            )
         )
-        k2z, k2U, k2V = self.rhs(s2)
 
         # k3
-        s3 = State(
-            s2.z + k2z * half_dt,
-            s2.U + k2U * half_dt,
-            s2.V + k2V * half_dt,
-            s2.t + half_dt,
+        k3z, k3U, k3V = self.rhs(
+            State(
+                state.z + k2z * half_dt,
+                state.U + k2U * half_dt,
+                state.V + k2V * half_dt,
+                state.t + half_dt,
+            )
         )
-        k3z, k3U, k3V = self.rhs(s3)
 
         # k4
-        s4 = State(
-            s3.z + k2z * dt,
-            s3.U + k2U * dt,
-            s3.V + k2V * dt,
-            s3.t + dt,
+        k4z, k4U, k4V = self.rhs(
+            State(
+                state.z + k3z * dt,
+                state.U + k3U * dt,
+                state.V + k3V * dt,
+                state.t + dt,
+            )
         )
-        k4z, k4U, k4V = self.rhs(s4)
 
         # RK4 solution
-        def rk4_solve(k1: Array, k2: Array, k3: Array, k4: Array) -> Array:
+        def rk4_step(k1: Array, k2: Array, k3: Array, k4: Array) -> Array:
             return (self.dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
-        dz = rk4_solve(k1z, k2z, k3z, k4z)
-        dU = rk4_solve(k1U, k2U, k3U, k4U)
-        dV = rk4_solve(k1V, k2V, k3V, k4V)
+        dz = rk4_step(k1z, k2z, k3z, k4z)
+        dU = rk4_step(k1U, k2U, k3U, k4U)
+        dV = rk4_step(k1V, k2V, k3V, k4V)
 
         return dz, dU, dV
 
@@ -248,12 +343,19 @@ class SWEModel:
         U = state.U
         V = state.V
 
-        # Compute spatial gradients
-        zx = self.grad_x(z)
-        zy = self.grad_y(z)
+        # Compute zeta spatial gradients
+        zx, zy = self.gradients(z)
 
-        # Compute derivatives of transport compoenent fluxes
-        Ux, Vy = self.flux_derivatives(U, V)
+        # Compute U, V gradients, using the desired method
+        if self.method == Method.FTCS:
+            # Centered space
+            Ux = self.grad_x(U)
+            Vy = self.grad_y(V)
+        elif self.method == Method.FV_RK4:
+            # Finite-volume
+            Ux, Vy = self.flux_gradients(U, V)
+        else:
+            raise NotImplementedError(f"No method == {self.method}!")
 
         # Compute pressure gradient terms
         pressure_u = self.constants.g * H * zx
@@ -265,7 +367,9 @@ class SWEModel:
         drag_v = self.constants.r * V * speed_term
 
         # Compute wind stress terms
-        wind_u, wind_v = self.forcing.wind_stress
+        wind_u, wind_v = self.forcing.wind_stress(
+            t=state.t, step=int(state.t / self.dt)
+        )
 
         # Compute coriolis terms
         coriolis_u = self.constants.f * V
@@ -283,6 +387,9 @@ class SWEModel:
         Vt[land_mask] = 0.0
 
         return zt, Ut, Vt
+
+    def gradients(self, a: Array) -> tuple[Array, Array]:
+        return self.grad_x(a), self.grad_y(a)
 
     def grad_x(self, a: Array) -> Array:
         dx = self.grid.dx
@@ -334,7 +441,12 @@ class SWEModel:
 
         return ay
 
-    def flux_derivatives(self, U: Array, V: Array) -> tuple[Array, Array]:
+    def flux_gradients(self, U: Array, V: Array) -> tuple[Array, Array]:
+        """
+        Calculates gradient of fluxes through the cell faces, assuming
+        values are stored at cell centers (so fluxes must be calculated first).
+        Used for finite-volume (FV) integration.
+        """
         dx, dy = self.grid.dx, self.grid.dy
         ny, nx = self.grid.shape
         land_mask = self.grid.land_mask
@@ -351,7 +463,7 @@ class SWEModel:
         U_face[:, 1:-1][open_U] = 0.5 * (U[:, :-1][open_U] + U[:, 1:][open_U])
         V_face[1:-1, :][open_V] = 0.5 * (V[:-1, :][open_V] + V[1:, :][open_V])
 
-        # Compute flux derivatives
+        # Compute flux gradients
         Ux = (U_face[:, 1:] - U_face[:, :-1]) / dx
         Vy = (V_face[:-1, :] - V_face[1:, :]) / dy
         Ux[land_mask] = 0.0
