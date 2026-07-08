@@ -13,6 +13,14 @@ Vector = tuple[float, float]
 
 
 ##################################################
+# Integration methods                            #
+##################################################
+class Method(StrEnum):
+    EULER_ANDY = "EULER_ANDY"
+    RK4_AARON = "RK4_AARON"
+
+
+##################################################
 # Physical & Model Constants                     #
 ##################################################
 @dataclass(frozen=True)
@@ -124,15 +132,24 @@ class Forcing:
     wind: WindModel
     constants: Constants
 
-    def wind_stress(self, t: float, step: int) -> Vector:
+    def wind_stress(self, t: float, step: int, method: Method) -> Vector:
         wx, wy = self.wind(t=t, step=step)
-        wind_speed = math.sqrt(wx**2 + wy**2)
         wsf = self.constants.wsf
 
-        return (
-            wsf * wx * wind_speed,
-            wsf * wy * wind_speed,
-        )
+        if method == Method.EULER_ANDY:
+            return (
+                wsf * wx,
+                wsf * wy,
+            )
+        elif method == Method.RK4_AARON:
+            wind_speed = math.sqrt(wx**2 + wy**2)
+
+            return (
+                wsf * wx * wind_speed,
+                wsf * wy * wind_speed,
+            )
+        else:
+            raise NotImplementedError(f"No method == {self.method}!")
 
 
 ##################################################
@@ -144,6 +161,7 @@ class State:
     U: Array
     V: Array
     t: float
+    step: int
 
     @classmethod
     def init_zeros(cls, grid: Grid) -> "State":
@@ -153,6 +171,7 @@ class State:
             U=np.zeros(shape, dtype=np.float64),
             V=np.zeros(shape, dtype=np.float64),
             t=0.0,
+            step=0,
         )
 
     def copy(self) -> "State":
@@ -161,6 +180,7 @@ class State:
             U=self.U.copy(),
             V=self.V.copy(),
             t=self.t,
+            step=self.step,
         )
 
 
@@ -187,11 +207,11 @@ class StateHistory:
             V=np.empty((n, *shape), dtype=np.float64),
         )
 
-    def record(self, step: int, state: State) -> None:
+    def record(self, state: State) -> None:
         if self._i >= len(self.steps):
             raise IndexError("Hey! The StateHistory is FULL! ;)")
 
-        self.steps[self._i] = step
+        self.steps[self._i] = state.step
         self.t[self._i] = state.t
         self.z[self._i] = state.z
         self.U[self._i] = state.U
@@ -213,11 +233,6 @@ class StateHistory:
 ##################################################
 # THE Shallow Water Equations Model!!            #
 ##################################################
-class Method(StrEnum):
-    FTCS = "FTCS"
-    FV_RK4 = "Finite-volume RK4"
-
-
 @dataclass
 class SWEModel:
     constants: Constants
@@ -229,9 +244,9 @@ class SWEModel:
     method: Method
 
     def run(self, n_steps: int):
-        for step in range(1, n_steps + 1):
+        for _ in range(n_steps):
             self.step()
-            yield step, self.state.copy()
+            yield self.state.copy()
 
     def run_with_history(
         self,
@@ -245,21 +260,21 @@ class SWEModel:
             n=n,
             shape=self.grid.shape,
         )
-        history.record(0, self.state)
+        history.record(self.state)
 
-        for step, state in self.run(n_steps):
-            if step % save_every == 0:
-                history.record(step, state)
+        for state in self.run(n_steps):
+            if state.step % save_every == 0:
+                history.record(state)
 
         return history
 
     def step(self) -> None:
         # Run numerical integration, using desired method
-        if self.method == Method.FTCS:
+        if self.method == Method.EULER_ANDY:
             # Forward-time (Euler)
             dz, dU, dV = self.euler()
-        elif self.method == Method.FV_RK4:
-            # Runge-Kutta
+        elif self.method == Method.RK4_AARON:
+            # Runge-Kutta 4
             dz, dU, dV = self.rk4()
         else:
             raise NotImplementedError(f"No method == {self.method}!")
@@ -268,6 +283,7 @@ class SWEModel:
         self.state.U += dU
         self.state.V += dV
         self.state.t += self.dt
+        self.state.step += 1
 
         # Apply closed lake boundary conditions
         land_mask = self.grid.land_mask
@@ -299,6 +315,7 @@ class SWEModel:
                 state.U + k1U * half_dt,
                 state.V + k1V * half_dt,
                 state.t + half_dt,
+                state.step,
             )
         )
 
@@ -309,6 +326,7 @@ class SWEModel:
                 state.U + k2U * half_dt,
                 state.V + k2V * half_dt,
                 state.t + half_dt,
+                state.step,
             )
         )
 
@@ -319,6 +337,7 @@ class SWEModel:
                 state.U + k3U * dt,
                 state.V + k3V * dt,
                 state.t + dt,
+                state.step,
             )
         )
 
@@ -344,41 +363,58 @@ class SWEModel:
         V = state.V
 
         # Compute zeta spatial gradients
-        zx, zy = self.gradients(z)
+        zx, zy = self.grad_xy(z)
 
-        # Compute U, V gradients, using the desired method
-        if self.method == Method.FTCS:
-            # Centered space
-            Ux = self.grad_x(U)
-            Vy = self.grad_y(V)
-        elif self.method == Method.FV_RK4:
-            # Finite-volume
-            Ux, Vy = self.flux_gradients(U, V)
-        else:
-            raise NotImplementedError(f"No method == {self.method}!")
+        # Compute U, V spatial gradients
+        Ux = self.grad_x(U)
+        Vy = self.grad_y(V)
 
         # Compute pressure gradient terms
         pressure_u = self.constants.g * H * zx
         pressure_v = self.constants.g * H * zy
 
         # Compute bottom drag terms
-        speed_term = np.sqrt(U**2 + V**2) / np.maximum(self.grid.H, 1e-3) ** 2
-        drag_u = self.constants.r * U * speed_term
-        drag_v = self.constants.r * V * speed_term
+        if self.method == Method.EULER_ANDY:
+            # Compute bottom drag terms
+            drag_u = self.constants.r * U
+            drag_v = self.constants.r * V
+        elif self.method == Method.RK4_AARON:
+            speed_term = np.sqrt(U**2 + V**2) / np.maximum(self.grid.H, 1e-3) ** 2
+            drag_u = self.constants.r * U * speed_term
+            drag_v = self.constants.r * V * speed_term
+        else:
+            raise NotImplementedError(f"No method == {self.method}!")
 
         # Compute wind stress terms
         wind_u, wind_v = self.forcing.wind_stress(
-            t=state.t, step=int(state.t / self.dt)
+            t=state.t,
+            step=state.step,
+            method=self.method,
         )
 
         # Compute coriolis terms
         coriolis_u = self.constants.f * V
         coriolis_v = self.constants.f * U
 
+        # Compute diffusion terms
+        Ah = 1000.0
+        dx, dy = self.grid.dx, self.grid.dy
+
+        lap_U = np.zeros_like(U)
+        lap_V = np.zeros_like(V)
+
+        lap_U[1:-1, 1:-1] = (
+            U[1:-1, 2:] - 2 * U[1:-1, 1:-1] + U[1:-1, :-2]
+        ) / dx**2 + (U[2:, 1:-1] - 2 * U[1:-1, 1:-1] + U[:-2, 1:-1]) / dy**2
+
+        lap_V[1:-1, 1:-1] = (
+            V[1:-1, 2:] - 2 * V[1:-1, 1:-1] + V[1:-1, :-2]
+        ) / dx**2 + (V[2:, 1:-1] - 2 * V[1:-1, 1:-1] + V[:-2, 1:-1]) / dy**2
+
         # Compute RHS
         zt = -(Ux + Vy)
-        Ut = -pressure_u - drag_u + wind_u + coriolis_u
-        Vt = -pressure_v - drag_v + wind_v - coriolis_v
+        Ut = -pressure_u + wind_u + coriolis_u - drag_u + Ah * lap_U
+        Vt = -pressure_v + wind_v - coriolis_v - drag_v + Ah * lap_V
 
         # Mask land
         land_mask = self.grid.land_mask
@@ -388,85 +424,23 @@ class SWEModel:
 
         return zt, Ut, Vt
 
-    def gradients(self, a: Array) -> tuple[Array, Array]:
+    def grad_xy(self, a: Array) -> tuple[Array, Array]:
         return self.grad_x(a), self.grad_y(a)
 
     def grad_x(self, a: Array) -> Array:
         dx = self.grid.dx
-        water_mask = self.grid.water_mask
-
-        water_left = np.zeros_like(a, dtype=bool)
-        water_right = np.zeros_like(a, dtype=bool)
-        water_left[:, 1:] = water_mask[:, :-1]
-        water_right[:, :-1] = water_mask[:, 1:]
-
-        both = water_mask & water_left & water_right
-        left_only = water_mask & water_left & ~water_right
-        right_only = water_mask & ~water_left & water_right
-
-        a_left = np.zeros_like(a)
-        a_right = np.zeros_like(a)
-        a_left[:, 1:] = a[:, :-1]
-        a_right[:, :-1] = a[:, 1:]
 
         ax = np.zeros_like(a)
-        ax[both] = (a_right[both] - a_left[both]) / (2.0 * dx)  # Centered
-        ax[left_only] = (a[left_only] - a_left[left_only]) / dx  # Forward
-        ax[right_only] = (a_right[right_only] - a[right_only]) / dx  # Backward
+        ax[:, 1:-1] = (a[:, 2:] - a[:, :-2]) / (2.0 * dx)
+        ax[self.grid.land_mask] = 0.0
 
         return ax
 
     def grad_y(self, a: Array) -> Array:
         dy = self.grid.dy
-        water_mask = self.grid.water_mask
-
-        water_below = np.zeros_like(a, dtype=bool)
-        water_above = np.zeros_like(a, dtype=bool)
-        water_below[:-1, :] = water_mask[1:, :]
-        water_above[1:, :] = water_mask[:-1, :]
-
-        both = water_mask & water_above & water_below
-        below_only = water_mask & ~water_above & water_below
-        above_only = water_mask & water_above & ~water_below
-
-        a_below = np.zeros_like(a)
-        a_above = np.zeros_like(a)
-        a_below[:-1, :] = a[1:, :]
-        a_above[1:, :] = a[:-1, :]
 
         ay = np.zeros_like(a)
-        ay[both] = (a_above[both] - a_below[both]) / (2.0 * dy)  # Centered
-        ay[below_only] = (a[below_only] - a_below[below_only]) / dy  # Forward
-        ay[above_only] = (a_above[above_only] - a[above_only]) / dy  # Backward
+        ay[1:-1, :] = (a[2:, :] - a[:-2, :]) / (2.0 * dy)
+        ay[self.grid.land_mask] = 0.0
 
         return ay
-
-    def flux_gradients(self, U: Array, V: Array) -> tuple[Array, Array]:
-        """
-        Calculates gradient of fluxes through the cell faces, assuming
-        values are stored at cell centers (so fluxes must be calculated first).
-        Used for finite-volume (FV) integration.
-        """
-        dx, dy = self.grid.dx, self.grid.dy
-        ny, nx = self.grid.shape
-        land_mask = self.grid.land_mask
-        water_mask = self.grid.water_mask
-
-        # Grid faces are only open if both sides have water
-        open_U = water_mask[:, :-1] & water_mask[:, 1:]
-        open_V = water_mask[:-1, :] & water_mask[1:, :]
-
-        # Compute face fluxes by averaging transport components across the grid face
-        U_face = np.zeros((ny, nx + 1), dtype=np.float64)
-        V_face = np.zeros((ny + 1, nx), dtype=np.float64)
-
-        U_face[:, 1:-1][open_U] = 0.5 * (U[:, :-1][open_U] + U[:, 1:][open_U])
-        V_face[1:-1, :][open_V] = 0.5 * (V[:-1, :][open_V] + V[1:, :][open_V])
-
-        # Compute flux gradients
-        Ux = (U_face[:, 1:] - U_face[:, :-1]) / dx
-        Vy = (V_face[:-1, :] - V_face[1:, :]) / dy
-        Ux[land_mask] = 0.0
-        Vy[land_mask] = 0.0
-
-        return Ux, Vy
