@@ -16,8 +16,8 @@ Vector = tuple[float, float]
 # Integration methods                            #
 ##################################################
 class Method(StrEnum):
-    EULER_ANDY = "EULER_ANDY"
-    RK4_AARON = "RK4_AARON"
+    ANDY_METHOD = "Andy's Method"
+    AARON_METHOD = "Aaron's Method"
 
 
 ##################################################
@@ -136,12 +136,14 @@ class Forcing:
         wx, wy = self.wind(t=t, step=step)
         wsf = self.constants.wsf
 
-        if method == Method.EULER_ANDY:
+        if method == Method.ANDY_METHOD:
+            wind_speed = math.sqrt(wx**2 + wy**2)
+
             return (
-                wsf * wx,
-                wsf * wy,
+                wsf * wx * wind_speed,
+                wsf * wy * wind_speed,
             )
-        elif method == Method.RK4_AARON:
+        elif method == Method.AARON_METHOD:
             wind_speed = math.sqrt(wx**2 + wy**2)
 
             return (
@@ -270,10 +272,10 @@ class SWEModel:
 
     def step(self) -> None:
         # Run numerical integration, using desired method
-        if self.method == Method.EULER_ANDY:
+        if self.method == Method.ANDY_METHOD:
             # Forward-time (Euler)
             dz, dU, dV = self.euler()
-        elif self.method == Method.RK4_AARON:
+        elif self.method == Method.AARON_METHOD:
             # Runge-Kutta 4
             dz, dU, dV = self.rk4()
         else:
@@ -374,11 +376,11 @@ class SWEModel:
         pressure_v = self.constants.g * H * zy
 
         # Compute bottom drag terms
-        if self.method == Method.EULER_ANDY:
+        if self.method == Method.ANDY_METHOD:
             # Compute bottom drag terms
             drag_u = self.constants.r * U
             drag_v = self.constants.r * V
-        elif self.method == Method.RK4_AARON:
+        elif self.method == Method.AARON_METHOD:
             speed_term = np.sqrt(U**2 + V**2) / np.maximum(self.grid.H, 1e-3) ** 2
             drag_u = self.constants.r * U * speed_term
             drag_v = self.constants.r * V * speed_term

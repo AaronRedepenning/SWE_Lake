@@ -40,13 +40,13 @@ BASE_GRID = Grid.from_txt("data/bathymetry.txt", 1000.0, 1000.0)
 
 METHOD_CONFIGS = [
     (
-        Method.EULER_ANDY,  # Integration method
+        Method.ANDY_METHOD,  # Integration method
         5.0,  # Time step [sec]
         1_000,  # Number of iterations
         1,  # Save every (save resolution)
     ),
     (
-        Method.RK4_AARON,  # Integration method
+        Method.AARON_METHOD,  # Integration method
         5.0,  # Time step [sec]
         1_000,  # Number of iterations
         1,  # Save every (save resolution)
