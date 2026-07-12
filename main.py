@@ -1,4 +1,4 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +10,8 @@ from model import (
     ConstantWind,
     Forcing,
     Grid,
-    Method,
+    GridType,
+    IntegrationMethod,
     State,
     StateHistory,
     StepWind,
@@ -40,13 +41,17 @@ BASE_GRID = Grid.from_txt("data/bathymetry.txt", 1000.0, 1000.0)
 
 METHOD_CONFIGS = [
     (
-        Method.ANDY_METHOD,  # Integration method
+        True,  # fully linear
+        IntegrationMethod.EULER,  # Integration method
+        GridType.CENTERED,  # Grid type
         5.0,  # Time step [sec]
         1_000,  # Number of iterations
         1,  # Save every (save resolution)
     ),
     (
-        Method.AARON_METHOD,  # Integration method
+        True,  # fully linear
+        IntegrationMethod.RK4,  # Integration method
+        GridType.C_GRID,  # Grid type
         5.0,  # Time step [sec]
         1_000,  # Number of iterations
         1,  # Save every (save resolution)
@@ -178,27 +183,38 @@ def main(show: bool = True, save: bool = True) -> None:
         scenario_dir = OUT_DIR / scenario.name.replace(" ", "_").lower()
         scenario_dir.mkdir(parents=True, exist_ok=True)
 
-        for method, dt, n_steps, save_every in METHOD_CONFIGS:
-            print(f"  using method = {method.name}")
+        for (
+            linear,
+            integration,
+            grid_type,
+            dt,
+            n_steps,
+            save_every,
+        ) in METHOD_CONFIGS:
+            print(f"  linear = {linear}")
+            print(f"  method = {integration.name}")
+            print(f"  grid_type = {grid_type.name}")
 
             model = SWEModel(
                 constants=CONSTANTS,
                 grid=grid,
                 forcing=scenario.forcing,
-                state=State.init_zeros(grid),
+                state=State.init_zeros(grid, grid_type),
                 dt=dt,
-                method=method,
+                linear=linear,
+                integration=integration,
+                grid_type=grid_type,
             )
 
             history = model.run_with_history(n_steps, save_every=save_every)
-            results[method.name] = history
+            results[f"{integration.name} / {grid_type.name}"] = history
 
             # Calculate vorticity and eddy kenetic energy
             vorticity_eke = calculate_vorticity_eke(
                 history,
                 grid,
             )
-            scenario_vorticity_eke[method.name] = vorticity_eke
+            scenario_vorticity_eke[integration.name] = vorticity_eke
 
             print(
                 f"    mean abs vorticity = {np.nanmean(np.abs(vorticity_eke.mean_vorticity)):.6e}"

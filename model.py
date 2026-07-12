@@ -10,14 +10,88 @@ from numpy.typing import NDArray
 
 Array = NDArray[np.float64]
 Vector = tuple[float, float]
+ArrayShape = tuple[int, int]
+ArrayMask = NDArray[np.bool_]
 
 
 ##################################################
 # Integration methods                            #
 ##################################################
-class Method(StrEnum):
-    ANDY_METHOD = "Andy's Method"
-    AARON_METHOD = "Aaron's Method"
+class IntegrationMethod(StrEnum):
+    EULER = "Euler"
+    RK4 = "RK4"
+
+
+##################################################
+# Grid types                                     #
+##################################################
+class GridType(StrEnum):
+    CENTERED = "Centered"
+    C_GRID = "C-Grid"
+
+
+def array_shapes(
+    grid: "Grid", grid_type: GridType
+) -> tuple[ArrayShape, ArrayShape, ArrayShape]:
+    """
+    Compute grid shapes depending on the gridding method.
+    """
+    if grid_type == GridType.CENTERED:
+        shape = grid.shape
+        return shape, shape, shape
+
+    elif grid_type == GridType.C_GRID:
+        ny, nx = grid.shape
+        return (ny, nx), (ny, nx + 1), (ny + 1, nx)
+
+    else:
+        raise NotImplementedError(grid_type)
+
+
+def array_water_masks(
+    grid: "Grid", grid_type: GridType
+) -> tuple[ArrayMask, ArrayMask, ArrayMask]:
+    if grid_type == GridType.CENTERED:
+        water = grid.water_mask
+        return water, water, water
+
+    elif grid_type == GridType.C_GRID:
+        water = grid.water_mask
+        _, U_shape, V_shape = array_shapes(grid, grid_type)
+
+        # U mask
+        U_mask = np.zeros(U_shape, dtype=np.bool_)
+
+        left_open = grid.H[:, :-1] > 0
+        right_open = grid.H[:, 1:] > 0
+
+        U_mask[:, 1:-1] = left_open & right_open
+
+        # V mask
+        V_mask = np.zeros(V_shape, dtype=np.bool_)
+
+        top_open = grid.H[:-1, :] > 0
+        bottom_open = grid.H[1:, :] > 0
+
+        V_mask[1:-1, :] = top_open & bottom_open
+
+        return water, U_mask, V_mask
+
+    else:
+        raise NotImplementedError(grid_type)
+
+
+def interpolate_grid(
+    state: "State",
+    grid_type: GridType,
+) -> tuple[Array, Array, Array]:
+    z, U, V = state.z, state.U, state.V
+
+    if grid_type == GridType.C_GRID:
+        U = 0.5 * (U[:, 1:] + U[:, :-1])
+        V = 0.5 * (V[1:, :] + V[:-1, :])
+
+    return z, U, V
 
 
 ##################################################
@@ -132,26 +206,21 @@ class Forcing:
     wind: WindModel
     constants: Constants
 
-    def wind_stress(self, t: float, step: int, method: Method) -> Vector:
+    def wind_stress(self, t: float, step: int, linear: bool = False) -> Vector:
         wx, wy = self.wind(t=t, step=step)
         wsf = self.constants.wsf
 
-        if method == Method.ANDY_METHOD:
-            wind_speed = math.sqrt(wx**2 + wy**2)
-
+        if linear:
             return (
-                wsf * wx * wind_speed,
-                wsf * wy * wind_speed,
-            )
-        elif method == Method.AARON_METHOD:
-            wind_speed = math.sqrt(wx**2 + wy**2)
-
-            return (
-                wsf * wx * wind_speed,
-                wsf * wy * wind_speed,
+                wsf * wx,
+                wsf * wy,
             )
         else:
-            raise NotImplementedError(f"No method == {self.method}!")
+            wind_speed = math.sqrt(wx**2 + wy**2)
+            return (
+                wsf * wx * wind_speed,
+                wsf * wy * wind_speed,
+            )
 
 
 ##################################################
@@ -166,12 +235,17 @@ class State:
     step: int
 
     @classmethod
-    def init_zeros(cls, grid: Grid) -> "State":
-        shape = grid.shape
+    def init_zeros(
+        cls,
+        grid: Grid,
+        grid_type: GridType = GridType.CENTERED,
+    ) -> "State":
+        z_shape, U_shape, V_shape = array_shapes(grid, grid_type)
+
         return cls(
-            z=np.zeros(shape, dtype=np.float64),
-            U=np.zeros(shape, dtype=np.float64),
-            V=np.zeros(shape, dtype=np.float64),
+            z=np.zeros(z_shape, dtype=np.float64),
+            U=np.zeros(U_shape, dtype=np.float64),
+            V=np.zeros(V_shape, dtype=np.float64),
             t=0.0,
             step=0,
         )
@@ -200,7 +274,14 @@ class StateHistory:
     _i: int = field(default=0, init=False, repr=False)
 
     @classmethod
-    def allocate(cls, *, n: int, shape: tuple[int, int]) -> "StateHistory":
+    def allocate(
+        cls,
+        *,
+        n: int,
+        grid: Grid,
+    ) -> "StateHistory":
+        shape = grid.shape
+
         return cls(
             steps=np.empty(n, dtype=np.int64),
             t=np.empty(n, dtype=np.float64),
@@ -209,15 +290,17 @@ class StateHistory:
             V=np.empty((n, *shape), dtype=np.float64),
         )
 
-    def record(self, state: State) -> None:
+    def record(self, state: State, grid_type: GridType) -> None:
         if self._i >= len(self.steps):
             raise IndexError("Hey! The StateHistory is FULL! ;)")
 
+        z, U, V = interpolate_grid(state, grid_type)
+
         self.steps[self._i] = state.step
         self.t[self._i] = state.t
-        self.z[self._i] = state.z
-        self.U[self._i] = state.U
-        self.V[self._i] = state.V
+        self.z[self._i] = z
+        self.U[self._i] = U
+        self.V[self._i] = V
 
         self._i += 1
 
@@ -243,7 +326,9 @@ class SWEModel:
     state: State
 
     dt: float
-    method: Method
+    linear: bool
+    integration: IntegrationMethod
+    grid_type: GridType
 
     def run(self, n_steps: int):
         for _ in range(n_steps):
@@ -260,26 +345,26 @@ class SWEModel:
 
         history = StateHistory.allocate(
             n=n,
-            shape=self.grid.shape,
+            grid=self.grid,
         )
-        history.record(self.state)
+        history.record(self.state, self.grid_type)
 
         for state in self.run(n_steps):
             if state.step % save_every == 0:
-                history.record(state)
+                history.record(state, self.grid_type)
 
         return history
 
     def step(self) -> None:
         # Run numerical integration, using desired method
-        if self.method == Method.ANDY_METHOD:
+        if self.integration == IntegrationMethod.EULER:
             # Forward-time (Euler)
             dz, dU, dV = self.euler()
-        elif self.method == Method.AARON_METHOD:
+        elif self.integration == IntegrationMethod.RK4:
             # Runge-Kutta 4
             dz, dU, dV = self.rk4()
         else:
-            raise NotImplementedError(f"No method == {self.method}!")
+            raise NotImplementedError(self.integration)
 
         self.state.z += dz
         self.state.U += dU
@@ -287,11 +372,52 @@ class SWEModel:
         self.state.t += self.dt
         self.state.step += 1
 
+        # For C grid we apply bottom drag term by division
+        if self.grid_type == GridType.C_GRID:
+            if not self.linear:
+                # Compute bottom drag terms
+                U, V = self.state.U, self.state.V
+
+                V_on_U = np.zeros_like(U)
+                V_on_U[:, 1:-1] = 0.25 * (
+                    V[:-1, :-1] + V[1:, :-1] + V[:-1, 1:] + V[1:, 1:]
+                )
+
+                U_on_V = np.zeros_like(V)
+                U_on_V[1:-1, :] = 0.25 * (
+                    U[:-1, :-1] + U[:-1, 1:] + U[1:, :-1] + U[1:, 1:]
+                )
+
+                drag_u = (
+                    1.0
+                    + self.dt
+                    * self.constants.r
+                    * np.sqrt(U**2 + V_on_U**2)
+                    / np.maximum(self.grid.H, 1e-3) ** 2
+                )
+                drag_v = (
+                    1.0
+                    + self.dt
+                    * self.constants.r
+                    * np.sqrt(U_on_V**2 + V**2)
+                    / np.maximum(self.grid.H, 1e-3) ** 2
+                )
+
+                self.state.U /= drag_u
+                self.state.V /= drag_v
+
+            else:
+                # Compute bottom drag terms
+                drag = 1.0 + self.dt * self.constants.r
+
+                self.state.U /= drag
+                self.state.V /= drag
+
         # Apply closed lake boundary conditions
-        land_mask = self.grid.land_mask
-        self.state.z[land_mask] = 0.0
-        self.state.U[land_mask] = 0.0
-        self.state.V[land_mask] = 0.0
+        z_mask, U_mask, V_mask = array_water_masks(self.grid, self.grid_type)
+        self.state.z[~z_mask] = 0.0
+        self.state.U[~U_mask] = 0.0
+        self.state.V[~V_mask] = 0.0
 
     def euler(self) -> tuple[Array, Array, Array]:
         zt, Ut, Vt = self.rhs(self.state)
@@ -358,40 +484,74 @@ class SWEModel:
         Compute the right hand side (RHS) of the linearized
         shallow water equations.
         """
+        if self.grid_type == GridType.CENTERED:
+            zt, Ut, Vt = self.rhs_centered(state)
+
+        elif self.grid_type == GridType.C_GRID:
+            zt, Ut, Vt = self.rhs_cgrid(state)
+
+        else:
+            raise NotImplementedError(self.grid_type)
+
+        # Apply closed lake boundary conditions
+        z_mask, U_mask, V_mask = array_water_masks(self.grid, self.grid_type)
+        zt[~z_mask] = 0.0
+        Ut[~U_mask] = 0.0
+        Vt[~V_mask] = 0.0
+
+        return zt, Ut, Vt
+
+    def rhs_centered(self, state: State) -> tuple[Array, Array, Array]:
+        """
+        Compute the right hand side (RHS) for a centered grid.
+        """
         H = self.grid.H
 
         z = state.z
         U = state.U
         V = state.V
 
-        # Compute zeta spatial gradients
-        zx, zy = self.grad_xy(z)
+        dx, dy = self.grid.dx, self.grid.dy
 
-        # Compute U, V spatial gradients
-        Ux = self.grad_x(U)
-        Vy = self.grad_y(V)
+        # Compute zeta centered space gradients
+        zx = np.zeros_like(z)
+        zy = np.zeros_like(z)
+
+        zx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / (2.0 * dx)
+        zy[1:-1, :] = (z[2:, :] - z[:-2, :]) / (2.0 * dy)
+
+        zx[self.grid.land_mask] = 0.0
+        zy[self.grid.land_mask] = 0.0
+
+        # Compute U, V centered space gradients
+        Ux = np.zeros_like(U)
+        Vy = np.zeros_like(V)
+
+        Ux[:, 1:-1] = (U[:, 2:] - U[:, :-2]) / (2.0 * dx)
+        Vy[1:-1, :] = (V[2:, :] - V[:-2, :]) / (2.0 * dy)
+
+        Ux[self.grid.land_mask] = 0.0
+        Vy[self.grid.land_mask] = 0.0
 
         # Compute pressure gradient terms
         pressure_u = self.constants.g * H * zx
         pressure_v = self.constants.g * H * zy
 
         # Compute bottom drag terms
-        if self.method == Method.ANDY_METHOD:
+        if self.linear:
             # Compute bottom drag terms
             drag_u = self.constants.r * U
             drag_v = self.constants.r * V
-        elif self.method == Method.AARON_METHOD:
+        else:
             speed_term = np.sqrt(U**2 + V**2) / np.maximum(self.grid.H, 1e-3) ** 2
             drag_u = self.constants.r * U * speed_term
             drag_v = self.constants.r * V * speed_term
-        else:
-            raise NotImplementedError(f"No method == {self.method}!")
 
         # Compute wind stress terms
         wind_u, wind_v = self.forcing.wind_stress(
-            t=state.t,
-            step=state.step,
-            method=self.method,
+            state.t,
+            state.step,
+            self.linear,
         )
 
         # Compute coriolis terms
@@ -418,11 +578,66 @@ class SWEModel:
         Ut = -pressure_u + wind_u + coriolis_u - drag_u + Ah * lap_U
         Vt = -pressure_v + wind_v - coriolis_v - drag_v + Ah * lap_V
 
-        # Mask land
-        land_mask = self.grid.land_mask
-        zt[land_mask] = 0.0
-        Ut[land_mask] = 0.0
-        Vt[land_mask] = 0.0
+        return zt, Ut, Vt
+
+    def rhs_cgrid(self, state: State) -> tuple[Array, Array, Array]:
+        """
+        Compute the right hand side (RHS) for a C grid.
+        """
+        H = self.grid.H
+
+        z = state.z
+        U = state.U
+        V = state.V
+
+        dx, dy = self.grid.dx, self.grid.dy
+
+        # Compute zeta spatial gradients
+        zx = np.zeros_like(U)
+        zy = np.zeros_like(V)
+
+        zx[:, 1:-1] = (z[:, 1:] - z[:, :-1]) / dx
+        zy[1:-1, :] = (z[1:, :] - z[:-1, :]) / dy
+
+        # Compute U, V spatial gradients
+        Ux = (U[:, 1:] - U[:, :-1]) / dx
+        Vy = (V[1:, :] - V[:-1, :]) / dy
+
+        # Compute pressure gradient terms
+        HU = np.zeros_like(U)
+        HV = np.zeros_like(V)
+
+        HU[:, 1:-1] = 0.5 * (H[:, 1:] + H[:, :-1])
+        HV[1:-1, :] = 0.5 * (H[1:, :] + H[:-1, :])
+
+        _, U_mask, V_mask = array_water_masks(self.grid, self.grid_type)
+        HU[~U_mask] = 0.0
+        HV[~V_mask] = 0.0
+
+        pressure_u = self.constants.g * HU * zx
+        pressure_v = self.constants.g * HV * zy
+
+        # Compute wind stress terms
+        wind_u, wind_v = self.forcing.wind_stress(
+            state.t,
+            state.step,
+            self.linear,
+        )
+
+        # Compute coriolis terms
+        V_on_U = np.zeros_like(U)
+        V_on_U[:, 1:-1] = 0.25 * (V[:-1, :-1] + V[1:, :-1] + V[:-1, 1:] + V[1:, 1:])
+
+        U_on_V = np.zeros_like(V)
+        U_on_V[1:-1, :] = 0.25 * (U[:-1, :-1] + U[:-1, 1:] + U[1:, :-1] + U[1:, 1:])
+
+        coriolis_u = self.constants.f * V_on_U
+        coriolis_v = self.constants.f * U_on_V
+
+        # Compute RHS
+        zt = -(Ux + Vy)
+        Ut = -pressure_u + wind_u + coriolis_u
+        Vt = -pressure_v + wind_v - coriolis_v
 
         return zt, Ut, Vt
 
